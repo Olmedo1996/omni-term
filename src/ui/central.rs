@@ -72,20 +72,42 @@ impl App {
             let mut request = None;
             let mut snippet_text: Option<String> = None;
             let mut pasted: Option<(u64, String)> = None;
+            let mut close_pane: Option<u64> = None;
+            let mut drag_pane: Option<u64> = None;
+            let tab_id = self.tabs[active].id;
+            let pane_count = match &self.tabs[active].body {
+                Body::Terminal { panes, .. } => panes.len(),
+                _ => 0,
+            };
+            let draggable = self.can_drag_pane(tab_id, pane_count);
+            let dragging = self.pane_drag.is_some();
+            self.drop_targets.panes = None;
             if let Body::Settings(section) = self.tabs[active].body {
                 let section = self.settings_page(ui, area.shrink2(Vec2::new(24.0, 16.0)), section);
                 self.tabs[active].body = Body::Settings(section);
             }
             match &mut self.tabs[active].body {
                 Body::Settings(_) => {}
-                Body::Terminal { panes, focused, .. } => {
-                    let gap = if panes.len() > 1 { SPLIT_GAP } else { 0.0 };
-                    let (leaves, handles) = panes.layout(text_area, gap);
+                Body::Terminal { panes, focused, zoomed, .. } => {
+                    if input_enabled && panes.len() > 1 {
+                        pane_keys(ctx, panes, focused, zoomed);
+                    }
+                    if zoomed.is_some_and(|id| !panes.contains(id)) {
+                        *zoomed = None;
+                    }
+                    let (leaves, handles) = match *zoomed {
+                        Some(id) => (vec![(id, text_area)], Vec::new()),
+                        None => panes.layout(text_area, if panes.len() > 1 { SPLIT_GAP } else { 0.0 }),
+                    };
+                    self.drop_targets.panes = Some((tab_id, leaves.clone()));
 
                     let mut ratios = Vec::new();
                     for (index, handle) in handles.iter().enumerate() {
                         let id = ui.scope_id().with(("split-handle", active, index));
-                        let response = ui.interact(handle.rect, id, Sense::drag());
+                        let response = ui.interact(handle.rect, id, Sense::click_and_drag());
+                        if response.double_clicked() {
+                            ratios.push((handle.path.clone(), 0.5));
+                        }
                         let icon = match handle.dir {
                             Dir::Horizontal => egui::CursorIcon::ResizeHorizontal,
                             Dir::Vertical => egui::CursorIcon::ResizeVertical,
@@ -107,19 +129,6 @@ impl App {
                         panes.set_ratio(&path, ratio);
                     }
 
-                    // Ctrl+Mayús+flechas mueven el foco entre paneles. Con un solo panel las flechas siguen siendo del terminal.
-                    if input_enabled && leaves.len() > 1 {
-                        let both = Modifiers::CTRL | Modifiers::SHIFT;
-                        let side = ctx.input_mut(|i| {
-                            [(Key::ArrowLeft, Side::Left), (Key::ArrowRight, Side::Right), (Key::ArrowUp, Side::Up), (Key::ArrowDown, Side::Down)]
-                                .into_iter()
-                                .find_map(|(key, side)| i.consume_key(both, key).then_some(side))
-                        });
-                        if let Some(next) = side.and_then(|side| neighbor(&leaves, *focused, side)) {
-                            *focused = next;
-                        }
-                    }
-
                     let pressed = ctx.input(|i| (i.pointer.primary_pressed() || i.pointer.button_pressed(egui::PointerButton::Secondary)).then(|| i.pointer.interact_pos()).flatten());
                     if let Some(position) = pressed {
                         if let Some((id, _)) = leaves.iter().find(|(_, rect)| rect.contains(position)) {
@@ -130,6 +139,36 @@ impl App {
                     for (id, rect) in &leaves {
                         if let Some(pane) = panes.get_mut(*id) {
                             pane.show(ui, *rect, input_enabled && *id == *focused, font_size);
+                        }
+                    }
+                    // Encima de los paneles: distintivo de ampliado, × para cerrar y asa para arrastrar el panel bajo el puntero.
+                    if panes.len() > 1 || draggable {
+                        let pointer = ctx.pointer_hover_pos();
+                        for (id, rect) in &leaves {
+                            let search_open = panes.get(*id).is_some_and(Pane::search_open);
+                            let corner = Rect::from_min_size(Pos2::new(rect.max.x - PANE_BUTTON, rect.min.y), Vec2::splat(PANE_BUTTON));
+                            let grip_slot = corner.translate(Vec2::new(-PANE_BUTTON, 0.0));
+                            if zoomed.is_some() && !search_open {
+                                let galley = ui.painter().layout_no_wrap("Ampliado".to_string(), FontId::proportional(theme::size::CAPTION), theme::subtext());
+                                let badge = Rect::from_min_size(Pos2::new(grip_slot.min.x - galley.size().x - theme::space::L * 2.0, rect.min.y + theme::space::XS), galley.size() + Vec2::new(theme::space::L, theme::space::XS) * 2.0);
+                                ui.painter().rect_filled(badge, CornerRadius::same(theme::radius::SMALL), theme::surface());
+                                ui.painter().galley(badge.min + Vec2::new(theme::space::L, theme::space::XS), galley, theme::subtext());
+                            }
+                            if search_open || !input_enabled || dragging || !pointer.is_some_and(|p| rect.contains(p)) {
+                                continue;
+                            }
+                            if panes.len() > 1 {
+                                let close = crate::ui::kit::IconButton::new(icons::X).color(theme::subtext()).show_at(ui, corner, ("pane-close", active, *id));
+                                if close.on_hover_text("Cerrar panel  (Ctrl+Shift+W)").clicked() {
+                                    close_pane = Some(*id);
+                                }
+                            }
+                            if draggable {
+                                let slot = if panes.len() > 1 { grip_slot } else { corner };
+                                if pane_grip(ui, slot, ("pane-grip", active, *id)).drag_started() {
+                                    drag_pane = Some(*id);
+                                }
+                            }
                         }
                     }
                     if leaves.len() > 1 {
@@ -179,8 +218,14 @@ impl App {
             match request {
                 Some(PaneRequest::SplitRight) => self.split_active(Dir::Horizontal),
                 Some(PaneRequest::SplitDown) => self.split_active(Dir::Vertical),
-                Some(PaneRequest::Close) => self.close_focused_pane(),
+                Some(PaneRequest::Close) => self.request_close_focused_pane(),
                 None => {}
+            }
+            if let Some(pane) = close_pane {
+                self.request_close_pane(tab_id, pane);
+            }
+            if let Some(pane) = drag_pane {
+                self.start_pane_drag(tab_id, pane);
             }
 
             let mut title = self.tabs[active].title();
@@ -217,4 +262,54 @@ impl App {
             self.reconnect(index);
         }
     }
+}
+
+/// Lado del botón de cerrar de cada panel.
+const PANE_BUTTON: f32 = 30.0;
+/// Cuánto mueve el borde cada pulsación de Alt+Mayús+flecha.
+const NUDGE_STEP: f32 = 0.05;
+
+/// Atajos de paneles, reservados solo con la pestaña dividida (con un panel llegan a la aplicación):
+/// Alt+flechas cambia de panel, Alt+Mayús+flechas mueve su borde y Ctrl+Mayús+Z amplía o restaura.
+fn pane_keys(ctx: &egui::Context, panes: &mut Tree<Pane>, focused: &mut u64, zoomed: &mut Option<u64>) {
+    const ARROWS: [(Key, Side); 4] = [(Key::ArrowLeft, Side::Left), (Key::ArrowRight, Side::Right), (Key::ArrowUp, Side::Up), (Key::ArrowDown, Side::Down)];
+    ctx.input_mut(|i| {
+        if i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Z) {
+            *zoomed = if zoomed.is_some() { None } else { Some(*focused) };
+        }
+        for (key, side) in ARROWS {
+            // Primero con Mayús: `consume_key` ignora un Mayús de más, y Alt+flecha se lo llevaría.
+            let nudges = i.count_and_consume_key(Modifiers::ALT | Modifiers::SHIFT, key);
+            if nudges > 0 && zoomed.is_none() {
+                for _ in 0..nudges {
+                    panes.nudge(*focused, side, NUDGE_STEP);
+                }
+            }
+            if i.consume_key(Modifiers::ALT, key) {
+                *zoomed = None;
+                if let Some(next) = panes.neighbor(*focused, side) {
+                    *focused = next;
+                }
+            }
+        }
+    });
+}
+
+/// Asa para arrastrar un panel: seis puntos, con cursor de agarrar.
+fn pane_grip(ui: &mut egui::Ui, slot: Rect, id: impl std::hash::Hash + std::fmt::Debug) -> egui::Response {
+    let rect = Rect::from_center_size(slot.center(), Vec2::splat(PANE_BUTTON - theme::space::XS));
+    let response = ui.interact(rect, ui.scope_id().with(id), Sense::drag());
+    let hot = response.hovered() || response.dragged();
+    if hot {
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::radius::CONTROL), theme::selection());
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    let ink = if hot { theme::text() } else { theme::subtext() };
+    for row in [-1.0, 0.0, 1.0] {
+        for column in [-0.5, 0.5] {
+            let dot = rect.center() + Vec2::new(column * theme::space::S, row * theme::space::S);
+            ui.painter().circle_filled(dot, theme::stroke::MEDIUM, ink);
+        }
+    }
+    response.on_hover_text("Arrastrar el panel a otro sitio, a otra pestaña o a una pestaña nueva")
 }

@@ -224,6 +224,11 @@ impl Pane {
         self.id
     }
 
+    /// Cambia el id al mover el panel a otra pestaña, donde debe coincidir con su hoja del árbol.
+    pub fn set_id(&mut self, id: u64) {
+        self.id = id;
+    }
+
     pub fn select_all(&self) {
         let mut term = self.session.term.lock().unwrap();
         let start = Point::new(term.topmost_line(), Column(0));
@@ -269,6 +274,12 @@ impl Pane {
 
         let id = ui.scope_id().with(("terminal", self.id));
         let response = ui.interact(area, id, Sense::click_and_drag());
+        // Al dejar de ser el panel activo (Alt+flechas, otro panel de la división) suelta el teclado, para que
+        // el nuevo lo pueda tomar en el siguiente fotograma.
+        if !self.input_enabled && ui.memory(|m| m.has_focus(id)) {
+            ui.memory_mut(|m| m.surrender_focus(id));
+            ui.ctx().request_repaint();
+        }
         // No se roba el foco a otros campos de texto (búsqueda del sidebar, renombrar pestaña).
         if self.input_enabled && self.search.is_none() && ui.memory(|m| m.focused().is_none_or(|f| f == id)) {
             ui.memory_mut(|m| m.request_focus(id));
@@ -555,6 +566,11 @@ impl Pane {
                 ui.close();
             }
         }
+    }
+
+    /// La barra de búsqueda ocupa la esquina superior derecha del panel.
+    pub fn search_open(&self) -> bool {
+        self.search.is_some()
     }
 
     pub fn toggle_search(&mut self) {
